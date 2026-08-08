@@ -130,6 +130,14 @@ export function detectRecurring(enriched, today = new Date()) {
     const chargesPerMonth =
       cadence === 'weekly' ? 30.44 / 7 : cadence === 'monthly' ? 1 : cadence === 'quarterly' ? 1 / 3 : 1 / 12
     const last = sorted[sorted.length - 1]
+    // payment-method change: compare the latest stated method with the previous distinct stated method
+    const methods = sorted.map((t) => t.payment_method).filter(Boolean)
+    let methodChange = null
+    if (methods.length >= 2) {
+      const lastMethod = methods[methods.length - 1]
+      const prevDistinct = [...methods.slice(0, -1)].reverse().find((m) => m !== lastMethod)
+      if (prevDistinct) methodChange = { from: prevDistinct, to: lastMethod }
+    }
     const lastAmt = last.sgd
     const prevAmts = withSgd.slice(0, -1).map((t) => t.sgd)
     const prevTypical = median(prevAmts)
@@ -150,6 +158,8 @@ export function detectRecurring(enriched, today = new Date()) {
       lastDate: last.txn_date,
       lastAmt,
       priceChange,
+      methodChange,
+      lastMethod: methods.length ? methods[methods.length - 1] : null,
       lapsed: daysSince > staleAfter,
       txns: sorted,
     })
@@ -174,8 +184,22 @@ export function findDuplicates(enriched) {
 }
 
 // Insights: each one is computed and cites its numbers.
-export function buildInsights(enriched, months, recurring, duplicates) {
+export function buildInsights(enriched, months, recurring, duplicates, openMissing = 0) {
   const insights = []
+  if (openMissing > 0) {
+    insights.push({
+      level: 'warn',
+      head: `${openMissing} email(s) contain charges this app cannot read`,
+      body: 'PDF-attachment invoices, statements behind logins, etc. — so totals here UNDERSTATE real spending. See the Missing tab; sending those PDFs/screenshots to Claude closes the gap.',
+    })
+  }
+  for (const r of recurring.filter((x) => x.methodChange).slice(0, 4)) {
+    insights.push({
+      level: 'info',
+      head: `${r.merchant}: payment method changed — ${r.methodChange.from} → ${r.methodChange.to}`,
+      body: 'Detected from the receipts themselves. If this wasn’t you, check the account.',
+    })
+  }
   const completed = months.filter((m) => m.month < new Date().toISOString().slice(0, 7))
   const cur = months.find((m) => m.month === new Date().toISOString().slice(0, 7))
   const lastM = completed[completed.length - 1]

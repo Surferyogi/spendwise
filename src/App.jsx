@@ -17,9 +17,9 @@ import {
 import { MonthlyBars, HBarList } from './charts.jsx'
 
 // Version stamp — updated on every App.jsx change (vYYYY:MM:DD-HH:MM)
-export const APP_VERSION = 'v2026:08:07-11:59'
+export const APP_VERSION = 'v2026:08:08-21:52'
 
-const TABS = ['Overview', 'Transactions', 'Recurring', 'Insights', 'Budgets', 'Data']
+const TABS = ['Overview', 'Transactions', 'Recurring', 'Insights', 'Budgets', 'Missing', 'Data']
 
 export default function App() {
   const [session, setSession] = useState(undefined) // undefined = loading
@@ -78,6 +78,7 @@ function Main({ session }) {
   const [tab, setTab] = useState('Overview')
   const [txns, setTxns] = useState(null)
   const [budgets, setBudgets] = useState([])
+  const [unparsed, setUnparsed] = useState([])
   const [fx, setFx] = useState({ rates: {}, fetchedAt: null, failed: [], loading: true })
   const [loadErr, setLoadErr] = useState('')
 
@@ -91,6 +92,8 @@ function Main({ session }) {
     setTxns(data)
     const { data: b } = await supabase.from('spend_budgets').select('*')
     setBudgets(b || [])
+    const { data: u } = await supabase.from('spend_unparsed').select('*').order('email_date', { ascending: false, nullsFirst: false })
+    setUnparsed(u || [])
     if (data.length) {
       const dates = data.map((t) => t.txn_date)
       const currencies = data.map((t) => t.currency)
@@ -108,8 +111,13 @@ function Main({ session }) {
   const months = useMemo(() => byMonth(enriched), [enriched])
   const recurring = useMemo(() => detectRecurring(enriched), [enriched])
   const duplicates = useMemo(() => findDuplicates(enriched), [enriched])
-  const insights = useMemo(() => buildInsights(enriched, months, recurring, duplicates), [enriched, months, recurring, duplicates])
+  const openMissing = unparsed.filter((u) => u.status === 'open')
+  const insights = useMemo(
+    () => buildInsights(enriched, months, recurring, duplicates, openMissing.filter((u) => u.kind === 'missing_amount').length),
+    [enriched, months, recurring, duplicates, openMissing.length]
+  )
   const unconverted = enriched.filter((t) => t.sgd == null)
+  const latestDate = txns && txns.length ? txns.reduce((m, t) => (t.txn_date > m ? t.txn_date : m), txns[0].txn_date) : null
 
   return (
     <div className="app">
@@ -120,9 +128,25 @@ function Main({ session }) {
         <span style={{ color: 'var(--muted)', fontSize: 12 }}>{session.user.email}</span>
         <button className="btn ghost" style={{ padding: '5px 10px' }} onClick={() => supabase.auth.signOut()}>Sign out</button>
       </header>
+      {latestDate && (
+        <div style={{ color: 'var(--text-secondary)', fontSize: 12.5, padding: '0 2px 6px' }}>
+          Data through <b style={{ color: 'var(--text-primary)' }}>{latestDate}</b> (latest entry) · {txns.length} transactions
+          {openMissing.length > 0 && (
+            <>
+              {' '}·{' '}
+              <a style={{ color: 'var(--warning)', cursor: 'pointer' }} onClick={() => setTab('Missing')}>
+                {openMissing.length} item(s) need attention
+              </a>
+            </>
+          )}
+        </div>
+      )}
       <nav className="tabs">
         {TABS.map((t) => (
-          <button key={t} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>{t}</button>
+          <button key={t} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
+            {t}
+            {t === 'Missing' && openMissing.length > 0 ? ` (${openMissing.length})` : ''}
+          </button>
         ))}
       </nav>
 
@@ -141,6 +165,7 @@ function Main({ session }) {
       {txns && tab === 'Recurring' && <Recurring recurring={recurring} />}
       {txns && tab === 'Insights' && <Insights insights={insights} />}
       {txns && tab === 'Budgets' && <Budgets budgets={budgets} months={months} reload={reload} userId={session.user.id} />}
+      {txns && tab === 'Missing' && <Missing unparsed={unparsed} reload={reload} />}
       {txns && tab === 'Data' && <DataTab enriched={enriched} fx={fx} />}
 
       <div className="footer-note">
@@ -312,7 +337,10 @@ function Transactions({ enriched, reload, userId }) {
                 <td style={{ whiteSpace: 'nowrap' }}>{t.txn_date}</td>
                 <td>
                   <div className="merchant">{t.merchant}</div>
-                  <div className="desc" title={t.description || ''}>{t.description}</div>
+                  <div className="desc" title={t.description || ''}>
+                    {t.payment_method ? `[${t.payment_method}] ` : ''}
+                    {t.description}
+                  </div>
                 </td>
                 <td className="hide-sm">
                   <span className="catchip">
@@ -419,7 +447,13 @@ function Recurring({ recurring }) {
       </div>
       {lapsed.length > 0 && (
         <div className="card" style={{ overflowX: 'auto' }}>
-          <h2>Lapsed / stopped <span className="sub">— no recent charge at their usual cadence</span></h2>
+          <h2>Receipt trail stopped <span className="sub">— no recent charge at the usual cadence</span></h2>
+          <div className="notice info" style={{ marginBottom: 10 }}>
+            Two possible reasons, and this app cannot tell them apart from email alone: (1) you cancelled it — saving
+            banked; or (2) <b>billing moved to a payment method that doesn&apos;t email receipts here</b> (e.g. direct
+            card billing instead of PayPal). For each row below, check the merchant&apos;s account page; if it still
+            bills you, add those charges manually or send Claude a screenshot of the merchant&apos;s billing history.
+          </div>
           <RecTable rows={lapsed} />
         </div>
       )}
@@ -427,6 +461,8 @@ function Recurring({ recurring }) {
         Detection rule: ≥3 charges from the same merchant with a regular gap (weekly / monthly / quarterly / annual), or
         an explicit &quot;annual&quot; plan in the receipt. Per-charge figures are averages of the actual charges;
         usage-based items (e.g. AI auto-recharges) appear when they recur regularly and reflect real usage, not a fixed fee.
+        Payment methods shown are exactly what each receipt states; a ⚠ method flag means the stated method changed
+        between charges.
       </div>
     </>
   )
@@ -452,6 +488,12 @@ function RecTable({ rows }) {
               <div className="merchant">{r.merchant}</div>
               <div className="desc">
                 {r.count} charges · {r.category}
+                {r.lastMethod && <span> · via {r.lastMethod}</span>}
+                {r.methodChange && (
+                  <span style={{ color: 'var(--warning)' }}>
+                    {' '}⚠ method: {r.methodChange.from} → {r.methodChange.to}
+                  </span>
+                )}
                 {r.priceChange && (
                   <span style={{ color: 'var(--warning)' }}>
                     {' '}· price {fmtSGD(r.priceChange.from)} → {fmtSGD(r.priceChange.to)}
@@ -557,6 +599,81 @@ function Budgets({ budgets, months, reload, userId }) {
           )
         })}
       </div>
+    </>
+  )
+}
+
+function Missing({ unparsed, reload }) {
+  const [busyId, setBusyId] = useState(null)
+  const open = unparsed.filter((u) => u.status === 'open')
+  const missing = open.filter((u) => u.kind === 'missing_amount')
+  const suspicious = open.filter((u) => u.kind === 'suspicious')
+  const closed = unparsed.filter((u) => u.status !== 'open')
+
+  const setStatus = async (u, status) => {
+    setBusyId(u.id)
+    await supabase.from('spend_unparsed').update({ status }).eq('id', u.id)
+    setBusyId(null)
+    reload()
+  }
+
+  const Row = ({ u, actions = true }) => (
+    <div className="insight" style={{ borderLeftColor: u.kind === 'suspicious' ? 'var(--critical)' : 'var(--warning)' }}>
+      <div className="head">
+        {u.merchant || 'Unknown sender'}
+        {u.email_date && <span style={{ color: 'var(--muted)', fontWeight: 400 }}> · {u.email_date}</span>}
+      </div>
+      <div className="body">{u.subject}</div>
+      <div className="body" style={{ fontSize: 12.5 }}>{u.reason}</div>
+      {actions && (
+        <div className="row" style={{ marginTop: 6 }}>
+          <button className="btn ghost" style={{ padding: '3px 10px', fontSize: 12 }} disabled={busyId === u.id} onClick={() => setStatus(u, 'resolved')}>
+            Mark resolved
+          </button>
+          <button className="btn ghost" style={{ padding: '3px 10px', fontSize: 12 }} disabled={busyId === u.id} onClick={() => setStatus(u, 'dismissed')}>
+            Dismiss
+          </button>
+        </div>
+      )}
+    </div>
+  )
+
+  return (
+    <>
+      <div className="card">
+        <h2>
+          Charges this app cannot read <span className="sub">— {missing.length} open</span>
+        </h2>
+        <p style={{ color: 'var(--text-secondary)', fontSize: 13.5 }}>
+          These emails represent real bills or bookings whose amounts are locked in PDF attachments or behind logins,
+          so they are <b>not included in any total in this app</b> — your true spending is higher than shown. To close
+          each gap: download the PDF (or screenshot the statement) and give it to Claude to parse into the database,
+          or add the amount via Transactions → + Add manual, then mark the item resolved here.
+        </p>
+        {missing.length === 0 && <div className="desc">Nothing outstanding.</div>}
+        {missing.map((u) => <Row key={u.id} u={u} />)}
+      </div>
+      {suspicious.length > 0 && (
+        <div className="card">
+          <h2>Suspicious payment emails <span className="sub">— treat as phishing until proven otherwise</span></h2>
+          <p style={{ color: 'var(--text-secondary)', fontSize: 13.5 }}>
+            These match known pressure patterns (&quot;billing failure — update your payment details&quot;). Do not click
+            their links or enter card details. If concerned, go to the merchant&apos;s site directly by typing its address.
+          </p>
+          {suspicious.map((u) => <Row key={u.id} u={u} />)}
+        </div>
+      )}
+      {closed.length > 0 && (
+        <div className="card">
+          <h2>Resolved / dismissed <span className="sub">— {closed.length}</span></h2>
+          {closed.slice(0, 8).map((u) => (
+            <div key={u.id} className="desc" style={{ padding: '3px 0' }}>
+              {u.status === 'resolved' ? '✅' : '✕'} {u.merchant} — {u.subject}
+            </div>
+          ))}
+          {closed.length > 8 && <div className="desc">…and {closed.length - 8} more</div>}
+        </div>
+      )}
     </>
   )
 }
