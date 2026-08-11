@@ -1,7 +1,7 @@
 // SpendWise service worker v2.
 // Network-first for the app shell (so new deployments show up immediately);
 // cache is only a fallback for offline use. Static icons are cache-first.
-const CACHE = 'spendwise-v3'
+const CACHE = 'spendwise-v5'
 
 self.addEventListener('install', (e) => {
   self.skipWaiting()
